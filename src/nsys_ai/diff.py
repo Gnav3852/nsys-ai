@@ -7,13 +7,20 @@ as terminal/markdown/json output and later reused by a web compare UI.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from .fingerprint import get_profile_id
 from .overlap import overlap_analysis
 from .profile import Profile
 
 _log = logging.getLogger(__name__)
+
+STEP_TIME_REGRESSION_PCT = 5.0
+MIN_COMPARABILITY_CONFIDENCE = 0.5
+DIFF_ID_VERSION = "diff1"
 
 
 @dataclass(frozen=True)
@@ -46,6 +53,16 @@ class ProfileSummary:
     kernels: list[KernelAgg]
     nvtx: list[NvtxAgg]
     overlap: dict
+    profile_id: str = ""
+
+
+@dataclass(frozen=True)
+class CategoryDelta:
+    category: str  # "compute" | "communication" | "idle" | "launch_overhead"
+    before_ms: float
+    after_ms: float
+    delta_ms: float
+    delta_pct: float | None
 
 
 @dataclass(frozen=True)
@@ -92,6 +109,12 @@ class ProfileDiffSummary:
     overlap_delta: dict
     top_regressions: list[KernelDiff]
     top_improvements: list[KernelDiff]
+    verdict: str = "neutral"
+    comparability_confidence: float = 1.0
+    category_attribution: list[CategoryDelta] = field(default_factory=list)
+    step_time_delta_ms: float | None = None
+    step_time_delta_pct: float | None = None
+    diff_id: str = ""
 
 
 def _safe_int(x) -> int:
@@ -188,6 +211,8 @@ def build_profile_summary(
         for k in ("compute_only_ms", "nccl_only_ms", "overlap_ms", "idle_ms", "total_ms"):
             overlap[k] = round(overlap[k], 2)
 
+    pid = get_profile_id(prof.conn, fallback_path=prof.path)
+
     return ProfileSummary(
         path=prof.path,
         gpu=gpu,
@@ -197,11 +222,21 @@ def build_profile_summary(
         kernels=kernels,
         nvtx=nvtx,
         overlap=overlap,
+        profile_id=pid,
     )
 
 
-def collect_sanity_warnings(before: ProfileSummary, after: ProfileSummary) -> list[str]:
+def collect_sanity_warnings(
+    before: ProfileSummary, after: ProfileSummary
+) -> tuple[list[str], float]:
+    """Return (warnings, comparability_confidence in [0,1])."""
     warnings: list[str] = []
+    c_schema = 1.0
+    c_gpu = 1.0
+    c_workload = 1.0
+    c_kernel_overlap = 1.0
+    c_overlap = 1.0
+
     if (
         before.schema_version
         and after.schema_version
@@ -210,33 +245,101 @@ def collect_sanity_warnings(before: ProfileSummary, after: ProfileSummary) -> li
         warnings.append(
             f"Nsight schema/version differs: before='{before.schema_version}' after='{after.schema_version}'."
         )
+        c_schema = 0.0
     if before.gpu is not None and after.gpu is not None and before.gpu != after.gpu:
         warnings.append("Different GPU IDs selected between before/after (unexpected).")
+        c_gpu = 0.0
+
     if before.kernel_rows and after.kernel_rows:
-        # Very rough signal for "not comparable"
-        ratio = max(before.kernel_rows, after.kernel_rows) / max(
-            1, min(before.kernel_rows, after.kernel_rows)
-        )
-        if ratio >= 3.0:
+        lo = min(before.kernel_rows, after.kernel_rows)
+        hi = max(before.kernel_rows, after.kernel_rows)
+        c_workload = lo / hi
+        # Keep the legacy warning threshold so user-visible text doesn't change.
+        if hi / lo >= 3.0:
             warnings.append(
                 f"Kernel row counts differ a lot (before={before.kernel_rows}, after={after.kernel_rows}); compare may be dominated by workload differences."
             )
 
     b_keys = {k.key for k in before.kernels}
     a_keys = {k.key for k in after.kernels}
-    if b_keys and a_keys:
+    if b_keys and a_keys and len(b_keys) > 5 and len(a_keys) > 5:
         shared = b_keys.intersection(a_keys)
-        # If both profiles have a meaningful amount of kernels but share fewer than 5% of their names
-        if len(b_keys) > 5 and len(a_keys) > 5:
-            overlap_pct = len(shared) / min(len(b_keys), len(a_keys))
-            if overlap_pct < 0.05:
-                warnings.append(
-                    f"Profiles share almost no common kernels ({len(shared)} shared out of {len(b_keys)} and {len(a_keys)}). Are you comparing unrelated traces?"
-                )
+        c_kernel_overlap = len(shared) / min(len(b_keys), len(a_keys))
+        if c_kernel_overlap < 0.05:
+            warnings.append(
+                f"Profiles share almost no common kernels ({len(shared)} shared out of {len(b_keys)} and {len(a_keys)}). Are you comparing unrelated traces?"
+            )
 
     if before.overlap.get("error") or after.overlap.get("error"):
         warnings.append("Overlap analysis unavailable (missing kernels or schema).")
-    return warnings
+        c_overlap = 0.0
+
+    confidence = max(0.0, min(1.0, c_schema * c_gpu * c_workload * c_kernel_overlap * c_overlap))
+    # Return unrounded — compute_verdict reads this and the 0.5 gate must
+    # not be crossed by rounding artifacts (e.g. 0.4996 -> 0.5).
+    # Quantization happens at the serialization boundary in to_diff_json.
+    return warnings, confidence
+
+
+def _ms(overlap: dict, key: str) -> float:
+    return float(overlap.get(key) or 0.0)
+
+
+def compute_category_attribution(
+    before: ProfileSummary, after: ProfileSummary
+) -> list[CategoryDelta]:
+    # HTA convention: overlap_ms counts as compute; nccl_only_ms is exposed_comm.
+    # If either side's overlap analysis failed, attribution is unavailable —
+    # returning [] is honest "no signal", while all-zero buckets would look
+    # like a real "compute=0, comm=0, idle=0" measurement.
+    if before.overlap.get("error") or after.overlap.get("error"):
+        return []
+    buckets: list[tuple[str, float, float]] = [
+        (
+            "compute",
+            _ms(before.overlap, "compute_only_ms") + _ms(before.overlap, "overlap_ms"),
+            _ms(after.overlap, "compute_only_ms") + _ms(after.overlap, "overlap_ms"),
+        ),
+        (
+            "communication",
+            _ms(before.overlap, "nccl_only_ms"),
+            _ms(after.overlap, "nccl_only_ms"),
+        ),
+        (
+            "idle",
+            _ms(before.overlap, "idle_ms"),
+            _ms(after.overlap, "idle_ms"),
+        ),
+    ]
+    return [
+        CategoryDelta(
+            category=name,
+            before_ms=round(b_ms, 3),
+            after_ms=round(a_ms, 3),
+            delta_ms=round(a_ms - b_ms, 3),
+            delta_pct=round((a_ms - b_ms) / b_ms * 100.0, 2) if b_ms > 0 else None,
+        )
+        for name, b_ms, a_ms in buckets
+    ]
+
+
+def compute_verdict(step_time_delta_pct: float | None, confidence: float) -> str:
+    if confidence < MIN_COMPARABILITY_CONFIDENCE or step_time_delta_pct is None:
+        return "inconclusive"
+    if step_time_delta_pct >= STEP_TIME_REGRESSION_PCT:
+        return "regression_likely"
+    if step_time_delta_pct <= -STEP_TIME_REGRESSION_PCT:
+        return "improvement_likely"
+    return "neutral"
+
+
+def _make_diff_id(before_pid: str, after_pid: str, params: dict) -> str:
+    payload = json.dumps(
+        {"before": before_pid, "after": after_pid, "params": params},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"{DIFF_ID_VERSION}:sha256:{hashlib.sha256(payload).hexdigest()}"
 
 
 def _classify_delta(delta_ns: int, before_ns: int, after_ns: int) -> str:
@@ -268,7 +371,7 @@ def diff_profiles(
     t_after = trim_after if trim_after is not None else trim
     before = build_profile_summary(before_prof, gpu, t_before, nvtx_limit=nvtx_limit)
     after = build_profile_summary(after_prof, gpu, t_after, nvtx_limit=nvtx_limit)
-    warnings = collect_sanity_warnings(before, after)
+    warnings, comparability_confidence = collect_sanity_warnings(before, after)
 
     before_by_key = {k.key: k for k in before.kernels}
     after_by_key = {k.key: k for k in after.kernels}
@@ -372,6 +475,29 @@ def diff_profiles(
             except (TypeError, ValueError):
                 pass
 
+    category_attribution = compute_category_attribution(before, after)
+    step_time_delta_ms: float | None = None
+    step_time_delta_pct: float | None = None
+    if category_attribution:
+        step_time_before_ms = sum(c.before_ms for c in category_attribution)
+        delta = sum(c.after_ms for c in category_attribution) - step_time_before_ms
+        step_time_delta_ms = round(delta, 3)
+        if step_time_before_ms > 0:
+            step_time_delta_pct = round(delta / step_time_before_ms * 100.0, 2)
+    verdict = compute_verdict(step_time_delta_pct, comparability_confidence)
+    diff_id = _make_diff_id(
+        before.profile_id,
+        after.profile_id,
+        {
+            "gpu": gpu,
+            "trim_before": trim_before,
+            "trim_after": trim_after,
+            "limit": limit,
+            "sort": sort,
+            "nvtx_limit": nvtx_limit,
+        },
+    )
+
     return ProfileDiffSummary(
         before=before,
         after=after,
@@ -383,4 +509,10 @@ def diff_profiles(
         overlap_delta=overlap_delta,
         top_regressions=regressions[: max(0, int(limit))],
         top_improvements=improvements[: max(0, int(limit))],
+        verdict=verdict,
+        comparability_confidence=comparability_confidence,
+        category_attribution=category_attribution,
+        step_time_delta_ms=step_time_delta_ms,
+        step_time_delta_pct=step_time_delta_pct,
+        diff_id=diff_id,
     )

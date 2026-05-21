@@ -646,3 +646,325 @@ def test_diff_cli_json_structure_unchanged(tmp_path):
     assert "before" in payload and "after" in payload and "top_regressions" in payload
     assert "executive_summary" not in payload
     assert "ai_narrative" not in payload
+
+
+# ---------------------------------------------------------------------------
+# v0.1 diff schema: envelope, verdict, category attribution, confidence
+# ---------------------------------------------------------------------------
+
+
+def _make_overlap_dict(compute_only_ms, nccl_only_ms, overlap_ms, idle_ms):
+    """Helper to build a fake overlap dict matching overlap_analysis output."""
+    total = compute_only_ms + nccl_only_ms + overlap_ms + idle_ms
+    return {
+        "compute_only_ms": compute_only_ms,
+        "nccl_only_ms": nccl_only_ms,
+        "overlap_ms": overlap_ms,
+        "idle_ms": idle_ms,
+        "total_ms": total,
+        "overlap_pct": 0.0,
+        "compute_kernels": 1,
+        "nccl_kernels": 0,
+    }
+
+
+def test_v01_category_attribution_hta_convention():
+    """compute_category_attribution: overlap_ms counts as compute (HTA convention)."""
+    from nsys_ai.diff import ProfileSummary, compute_category_attribution
+
+    # before: compute_only=100, nccl_only=20, overlap=10, idle=5 → compute=110, comm=20, idle=5
+    before = ProfileSummary(
+        path="b",
+        gpu=0,
+        schema_version=None,
+        total_gpu_ns=0,
+        kernel_rows=0,
+        kernels=[],
+        nvtx=[],
+        overlap=_make_overlap_dict(100, 20, 10, 5),
+    )
+    # after: compute_only=120, nccl_only=25, overlap=15, idle=10 → compute=135, comm=25, idle=10
+    after = ProfileSummary(
+        path="a",
+        gpu=0,
+        schema_version=None,
+        total_gpu_ns=0,
+        kernel_rows=0,
+        kernels=[],
+        nvtx=[],
+        overlap=_make_overlap_dict(120, 25, 15, 10),
+    )
+    cats = {c.category: c for c in compute_category_attribution(before, after)}
+    assert cats["compute"].before_ms == 110.0  # 100 + 10 (overlap)
+    assert cats["compute"].after_ms == 135.0  # 120 + 15
+    assert cats["compute"].delta_ms == 25.0
+    assert cats["communication"].before_ms == 20.0  # exposed_comm = nccl_only
+    assert cats["communication"].after_ms == 25.0
+    assert cats["idle"].before_ms == 5.0
+    assert cats["idle"].after_ms == 10.0
+    # launch_overhead is intentionally absent in v0.1 (PR-B will add it).
+    assert "launch_overhead" not in cats
+
+
+def test_v01_compute_verdict_thresholds():
+    """compute_verdict applies ±5% threshold + confidence ≥ 0.5 gate."""
+    from nsys_ai.diff import compute_verdict
+
+    assert compute_verdict(None, 1.0) == "inconclusive"
+    assert compute_verdict(10.0, 0.3) == "inconclusive"  # low confidence
+    assert compute_verdict(4.9, 1.0) == "neutral"  # below +5%
+    assert compute_verdict(-4.9, 1.0) == "neutral"  # above -5%
+    assert compute_verdict(5.0, 1.0) == "regression_likely"
+    assert compute_verdict(20.0, 0.7) == "regression_likely"
+    assert compute_verdict(-5.0, 1.0) == "improvement_likely"
+    assert compute_verdict(-20.0, 0.7) == "improvement_likely"
+
+
+def test_v01_collect_sanity_warnings_returns_confidence():
+    """collect_sanity_warnings now returns (warnings, confidence)."""
+    from nsys_ai.diff import ProfileSummary, collect_sanity_warnings
+
+    matched = ProfileSummary(
+        path="x",
+        gpu=0,
+        schema_version="2024.1.1",
+        total_gpu_ns=100,
+        kernel_rows=100,
+        kernels=[],
+        nvtx=[],
+        overlap={},
+    )
+    warnings, conf = collect_sanity_warnings(matched, matched)
+    assert isinstance(warnings, list)
+    assert isinstance(conf, float)
+    assert 0.0 <= conf <= 1.0
+    assert conf == 1.0  # identical → perfect confidence
+    assert warnings == []
+
+    # Schema mismatch → C_schema = 0 → confidence = 0
+    other = ProfileSummary(
+        path="y",
+        gpu=0,
+        schema_version="2025.2.2",
+        total_gpu_ns=100,
+        kernel_rows=100,
+        kernels=[],
+        nvtx=[],
+        overlap={},
+    )
+    warnings, conf = collect_sanity_warnings(matched, other)
+    assert conf == 0.0
+    assert any("schema" in w.lower() for w in warnings)
+
+
+def test_v01_diff_json_envelope_and_verdict(tmp_path):
+    """diff JSON v0.1: envelope + verdict + category_attribution + profile_id."""
+    before = tmp_path / "before.sqlite"
+    after = tmp_path / "after.sqlite"
+    _make_profile(str(before), kernels=[(0, 10, 0, 7, 1, 1, 2)])
+    _make_profile(str(after), kernels=[(0, 20, 0, 7, 1, 1, 2)])
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "nsys_ai",
+            "diff",
+            str(before),
+            str(after),
+            "--gpu",
+            "0",
+            "--format",
+            "json",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+
+    # Envelope
+    assert payload["schema_version"] == "0.1"
+    assert payload["producer"] == "nsys-ai"
+    assert "producer_version" in payload
+    assert payload["diff_id"].startswith("diff1:sha256:")
+    # diff_id has a 64-char hex digest after the prefix
+    assert len(payload["diff_id"]) == len("diff1:sha256:") + 64
+
+    # profile_id in each side, content-derived
+    assert payload["before"]["profile_id"].startswith("nsys1:")
+    assert payload["after"]["profile_id"].startswith("nsys1:")
+
+    # Verdict + confidence
+    assert payload["verdict"] in {
+        "neutral",
+        "regression_likely",
+        "improvement_likely",
+        "inconclusive",
+    }
+    assert 0.0 <= payload["comparability_confidence"] <= 1.0
+
+    # step_time block
+    assert "step_time" in payload
+    assert "delta_ms" in payload["step_time"]
+
+    # category_attribution is a list of category bucket entries
+    cats = payload["category_attribution"]
+    assert isinstance(cats, list)
+    seen = {c["category"] for c in cats}
+    assert seen == {"compute", "communication", "idle"}
+
+
+def test_v01_confidence_separates_schema_and_gpu_mismatch():
+    """c_schema and c_gpu are independent factors; mismatching gpu alone zeros confidence."""
+    from nsys_ai.diff import ProfileSummary, collect_sanity_warnings
+
+    # Same schema, different gpu id → c_gpu = 0 → confidence = 0,
+    # but the warning text mentions GPU (not schema).
+    a = ProfileSummary(
+        path="a",
+        gpu=0,
+        schema_version="2024.1.1",
+        total_gpu_ns=100,
+        kernel_rows=100,
+        kernels=[],
+        nvtx=[],
+        overlap={},
+    )
+    b = ProfileSummary(
+        path="b",
+        gpu=1,  # different GPU id, same schema
+        schema_version="2024.1.1",
+        total_gpu_ns=100,
+        kernel_rows=100,
+        kernels=[],
+        nvtx=[],
+        overlap={},
+    )
+    warnings, conf = collect_sanity_warnings(a, b)
+    assert conf == 0.0
+    assert any("GPU" in w for w in warnings)
+    assert not any("schema" in w.lower() for w in warnings)
+
+
+def test_v01_no_signal_propagates_through_pipeline():
+    """Overlap error → confidence drops, attribution empty, step_time fields None,
+    JSON step_time is null (key present, value null). No fake-zero leakage."""
+    from nsys_ai.diff import ProfileDiffSummary, ProfileSummary, collect_sanity_warnings
+    from nsys_ai.diff_render import to_diff_json
+
+    good = ProfileSummary(
+        path="b",
+        gpu=0,
+        schema_version="2024.1.1",
+        total_gpu_ns=100,
+        kernel_rows=100,
+        kernels=[],
+        nvtx=[],
+        overlap=_make_overlap_dict(100, 20, 10, 5),
+    )
+    bad = ProfileSummary(
+        path="a",
+        gpu=0,
+        schema_version="2024.1.1",
+        total_gpu_ns=0,
+        kernel_rows=0,
+        kernels=[],
+        nvtx=[],
+        overlap={"error": "no kernels found"},
+    )
+
+    # confidence must reflect the unavailability (c_overlap = 0 -> product 0)
+    warnings, conf = collect_sanity_warnings(good, bad)
+    assert conf == 0.0
+    assert any("Overlap analysis unavailable" in w for w in warnings)
+
+    # Build a summary that mirrors what diff_profiles would emit on this path
+    # (empty attribution, both step_time fields None) and verify the JSON
+    # never leaks fake zeros.
+    summary = ProfileDiffSummary(
+        before=good,
+        after=bad,
+        warnings=warnings,
+        kernel_diffs=[],
+        nvtx_diffs=[],
+        overlap_before=good.overlap,
+        overlap_after=bad.overlap,
+        overlap_delta={},
+        top_regressions=[],
+        top_improvements=[],
+        verdict="inconclusive",
+        comparability_confidence=conf,
+    )
+    payload = json.loads(to_diff_json(summary))
+    assert payload["step_time"] is None
+    assert payload["category_attribution"] == []
+    assert payload["verdict"] == "inconclusive"
+    assert payload["comparability_confidence"] == 0.0
+
+
+def test_v01_category_attribution_empty_on_overlap_error():
+    """When either side has overlap error, attribution is [] (no fake zeros)."""
+    from nsys_ai.diff import ProfileSummary, compute_category_attribution
+
+    good = ProfileSummary(
+        path="b",
+        gpu=0,
+        schema_version=None,
+        total_gpu_ns=0,
+        kernel_rows=0,
+        kernels=[],
+        nvtx=[],
+        overlap=_make_overlap_dict(100, 20, 10, 5),
+    )
+    bad = ProfileSummary(
+        path="a",
+        gpu=0,
+        schema_version=None,
+        total_gpu_ns=0,
+        kernel_rows=0,
+        kernels=[],
+        nvtx=[],
+        overlap={"error": "no kernels found"},
+    )
+    assert compute_category_attribution(good, bad) == []
+    assert compute_category_attribution(bad, good) == []
+    assert compute_category_attribution(bad, bad) == []
+
+
+def test_v01_confidence_serialization_truncates_not_rounds():
+    """JSON-serialized confidence must never cross the 0.5 verdict gate
+    via rounding (e.g. 0.4996 must NOT show as 0.500)."""
+    from nsys_ai.diff import ProfileDiffSummary, ProfileSummary
+    from nsys_ai.diff_render import to_diff_json
+
+    bare = ProfileSummary(
+        path="", gpu=0, schema_version=None, total_gpu_ns=0,
+        kernel_rows=0, kernels=[], nvtx=[], overlap={},
+    )
+    summary = ProfileDiffSummary(
+        before=bare, after=bare, warnings=[], kernel_diffs=[], nvtx_diffs=[],
+        overlap_before={}, overlap_after={}, overlap_delta={},
+        top_regressions=[], top_improvements=[],
+        comparability_confidence=0.4996,
+    )
+    payload = json.loads(to_diff_json(summary))
+    assert payload["comparability_confidence"] == 0.499
+
+
+def test_v01_diff_id_is_stable_across_runs(tmp_path):
+    """Same inputs → same diff_id (content-derived; not random)."""
+    from nsys_ai import profile as profile_mod
+    from nsys_ai.diff import diff_profiles
+
+    before = tmp_path / "before.sqlite"
+    after = tmp_path / "after.sqlite"
+    _make_profile(str(before), kernels=[(0, 10, 0, 7, 1, 1, 2)])
+    _make_profile(str(after), kernels=[(0, 20, 0, 7, 1, 1, 2)])
+
+    with profile_mod.open(str(before)) as b, profile_mod.open(str(after)) as a:
+        d1 = diff_profiles(b, a, gpu=0, limit=10)
+    with profile_mod.open(str(before)) as b, profile_mod.open(str(after)) as a:
+        d2 = diff_profiles(b, a, gpu=0, limit=10)
+
+    assert d1.diff_id == d2.diff_id
+    assert d1.diff_id.startswith("diff1:sha256:")

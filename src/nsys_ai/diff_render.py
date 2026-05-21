@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 
 from .ai.diff_narrative import DiffNarrative
+from .annotation import PRODUCER, SCHEMA_VERSION, _producer_version
 from .diff import ProfileDiffSummary
 
 
@@ -435,14 +436,46 @@ def format_diff_markdown_multi(
 def to_diff_json(data: ProfileDiffSummary) -> str:
     # Keep this relatively stable; tests can snapshot it.
     payload = {
+        "schema_version": SCHEMA_VERSION,
+        "producer": PRODUCER,
+        "producer_version": _producer_version(),
+        "diff_id": data.diff_id,
+        "verdict": data.verdict,
+        # Truncate (not round) so the displayed value can never cross the
+        # 0.5 verdict gate in the wrong direction — e.g. unrounded 0.4996
+        # would round up to 0.500 and look like it should have passed the
+        # gate, contradicting the (correct) "inconclusive" verdict.
+        "comparability_confidence": int(data.comparability_confidence * 1000) / 1000,
+        "step_time": (
+            {
+                "before_ms": round(sum(c.before_ms for c in data.category_attribution), 3),
+                "after_ms": round(sum(c.after_ms for c in data.category_attribution), 3),
+                "delta_ms": data.step_time_delta_ms,
+                "delta_pct": data.step_time_delta_pct,
+            }
+            if data.category_attribution
+            else None
+        ),
+        "category_attribution": [
+            {
+                "category": c.category,
+                "before_ms": c.before_ms,
+                "after_ms": c.after_ms,
+                "delta_ms": c.delta_ms,
+                "delta_pct": c.delta_pct,
+            }
+            for c in data.category_attribution
+        ],
         "before": {
             "path": data.before.path,
+            "profile_id": data.before.profile_id,
             "gpu": data.before.gpu,
             "schema_version": data.before.schema_version,
             "total_gpu_ns": data.before.total_gpu_ns,
         },
         "after": {
             "path": data.after.path,
+            "profile_id": data.after.profile_id,
             "gpu": data.after.gpu,
             "schema_version": data.after.schema_version,
             "total_gpu_ns": data.after.total_gpu_ns,
